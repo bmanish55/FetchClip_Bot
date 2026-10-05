@@ -1,8 +1,4 @@
-"""FetchClip - Telegram media fetcher, Vercel (webhook) edition.
-
-Vercel's Python runtime loads a top-level ASGI/WSGI variable named `app`, so this file
-is a FastAPI app. Telegram posts updates to POST /api/webhook.
-"""
+"""FetchClip - Telegram media fetcher, Vercel (webhook) edition."""
 import asyncio
 import hmac
 import html
@@ -39,9 +35,8 @@ from telegram.ext import (
     filters,
 )
 
-try:  # only used for local testing; on Vercel the env vars come from the dashboard
+try:
     from dotenv import load_dotenv
-
     load_dotenv()
 except ImportError:
     pass
@@ -54,9 +49,9 @@ log = logging.getLogger("mediabot")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
 BOT_NAME = "FetchClip"
-MAX_MB = int(os.getenv("MAX_MB", "100"))  # Increased to 100MB internally so yt-dlp doesn't abort early
+MAX_MB = int(os.getenv("MAX_MB", "100"))  # Internal yt-dlp ceiling raised
 LIMIT = MAX_MB * 1024 * 1024
-LOW_HEIGHT = int(os.getenv("LOW_HEIGHT", "720")) # Set to 720p so Reddit DASH streams work!
+LOW_HEIGHT = int(os.getenv("LOW_HEIGHT", "720")) # 720p minimum required for Reddit
 MAX_PARALLEL = int(os.getenv("MAX_PARALLEL", "2"))
 USER_COOLDOWN = int(os.getenv("USER_COOLDOWN", "10"))
 CHECK_COOLDOWN = int(os.getenv("CHECK_COOLDOWN", "3"))
@@ -137,10 +132,8 @@ def extract_url(text: str) -> str | None:
     m = URL_RE.search(text or "")
     return m.group(0).rstrip(").,]") if m else None
 
-
 def _ip_ok(ip) -> bool:
     return not (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast)
-
 
 def is_safe_url(url: str) -> bool:
     try:
@@ -157,7 +150,6 @@ def is_safe_url(url: str) -> bool:
     except ValueError:
         return False
 
-
 def resolves_public(url: str) -> bool:
     host = urlparse(url).hostname or ""
     try:
@@ -168,21 +160,17 @@ def resolves_public(url: str) -> bool:
         return True
     return True
 
-
 def is_allowed_domain(url: str) -> bool:
     if not ALLOWED_DOMAINS:
         return True
     host = (urlparse(url).hostname or "").lower()
     return any(host == d or host.endswith("." + d) for d in ALLOWED_DOMAINS)
 
-
 def clean_error(err: Exception) -> str:
     msg = re.sub(r"\x1b\[[0-9;]*m", "", str(err))
     low = msg.lower()
-    if any(k in low for k in ("cloudflare", "anti-bot", "http error 403", "forbidden")):
-        return "This site blocked my server. Please try again later."
-    if "not a bot" in low:
-        return "YouTube is blocking my server right now. Please try again later."    
+    if any(k in low for k in ("cloudflare", "anti-bot", "http error 403", "forbidden", "not a bot")):
+        return "YouTube is blocking my server right now. Please try again later."
     if any(k in low for k in ("login", "sign in", "cookies", "private", "authentication")):
         return "This link needs a login or is private, so I can't download it."
     if "unsupported url" in low:
@@ -193,16 +181,52 @@ def clean_error(err: Exception) -> str:
         return "Couldn't reach that link. Check it and try again."
     return "Couldn't read that link. It may be removed, private or blocked."
 
+# ---------- Multi-Instance Cobalt Helper ----------
+
+async def call_cobalt(url: str, mode: str) -> str:
+    """Cycles through Cobalt instances to bypass Turnstile bot protection and returns direct URL."""
+    instances = [
+        "https://cobalt-api.hyper.lol/",
+        "https://cobalt.api.timelessnesses.me/",
+        "https://api.cobalt.tools/"
+    ]
+    req_body = {
+        "url": url, 
+        "videoQuality": "720", 
+        "downloadMode": "audio" if mode == "audio" else "auto"
+    }
+    headers = {
+        "Accept": "application/json", 
+        "Content-Type": "application/json",
+        "User-Agent": "FetchClip/1.1"
+    }
+    
+    last_err = "Unknown error"
+    async with httpx.AsyncClient(timeout=25.0) as client:
+        for api_url in instances:
+            try:
+                res = await client.post(api_url, json=req_body, headers=headers)
+                if res.status_code == 200:
+                    data = res.json()
+                    if data.get("status") in ["tunnel", "redirect"] and data.get("url"):
+                        return data["url"]
+                    elif data.get("status") == "error":
+                        # Parses new v10 error format correctly
+                        last_err = data.get("error", {}).get("code", "Blocked by Bot Protection")
+            except Exception as e:
+                last_err = str(e)
+                continue
+                
+    raise UserError(f"All API servers are currently blocking requests. (Last error: {last_err})")
+
 
 # ---------- Size check & quality choice ----------
 
 def has_v(f: dict) -> bool:
     return f.get("vcodec") != "none"
 
-
 def has_a(f: dict) -> bool:
     return f.get("acodec") != "none"
-
 
 def fsize(f: dict, duration: float) -> int | None:
     s = f.get("filesize") or f.get("filesize_approx")
@@ -213,60 +237,45 @@ def fsize(f: dict, duration: float) -> int | None:
         return int(tbr * 1000 / 8 * duration)
     return None
 
-
 def qual(f: dict) -> int:
     w, h = f.get("width"), f.get("height")
     return min(w, h) if w and h else (h or 0)
 
-
 def pick_video(cands: list[dict]) -> dict | None:
-    if not cands:
-        return None
-    def avc(f):
-        return (f.get("vcodec") or "").startswith("avc1")
+    if not cands: return None
+    def avc(f): return (f.get("vcodec") or "").startswith("avc1")
     low = [f for f in cands if 0 < qual(f) <= LOW_HEIGHT]
     if low:
         return max(low, key=lambda f: (qual(f), avc(f), f.get("ext") == "mp4", f.get("tbr") or 0))
     return None
 
-
 def pick_audio(fmts: list[dict]) -> dict | None:
     a = [f for f in fmts if has_a(f) and not has_v(f)]
-    if not a:
-        return None
-    def br(f):
-        return f.get("abr") or f.get("tbr") or 0
+    if not a: return None
+    def br(f): return f.get("abr") or f.get("tbr") or 0
     ok = [f for f in a if br(f) <= 130]
     if ok:
         return max(ok, key=lambda f: (f.get("ext") == "m4a", br(f)))
     return min(a, key=lambda f: (br(f), f.get("ext") != "m4a"))
-
 
 def plan_video(info: dict) -> dict | None:
     dur = info.get("duration") or 0
     fmts = info.get("formats") or []
     plans = []
     m = pick_video([f for f in fmts if has_v(f) and has_a(f)])
-    if m:
-        plans.append((qual(m), [m]))
+    if m: plans.append((qual(m), [m]))
     if HAVE_FFMPEG:
         v = pick_video([f for f in fmts if has_v(f) and not has_a(f)])
         a = pick_audio(fmts)
-        if v and a:
-            plans.append((qual(v), [v, a]))
-    if not plans:
-        return None
-    def key(p):
-        h = p[0]
-        return (0, -h) if 0 < h <= LOW_HEIGHT else (1, h)
+        if v and a: plans.append((qual(v), [v, a]))
+    if not plans: return None
+    def key(p): return (0, -p[0]) if 0 < p[0] <= LOW_HEIGHT else (1, p[0])
     plans.sort(key=key)
     height, parts = plans[0]
     sizes = [fsize(f, dur) for f in parts]
     est = sum(sizes) if all(s is not None for s in sizes) else None
-    if est is None and dur:
-        est = int(dur * UNKNOWN_BYTES_PER_SEC)
+    if est is None and dur: est = int(dur * UNKNOWN_BYTES_PER_SEC)
     return {"fmt": "+".join(str(f["format_id"]) for f in parts), "height": height, "est": est}
-
 
 def plan_audio(info: dict) -> dict | None:
     dur = info.get("duration") or 0
@@ -283,22 +292,17 @@ def plan_audio(info: dict) -> dict | None:
             return {"fmt": str(m["format_id"]), "est": est, "extract": True}
     return None
 
-
 def size_txt(est: int | None) -> str:
-    if est is None:
-        return "size unknown"
+    if est is None: return "size unknown"
     mb = est / 1e6
     return f"~{mb:.1f} MB" if mb < 10 else f"~{mb:.0f} MB"
 
-
 def dur_txt(sec: float | None) -> str:
-    if not sec:
-        return ""
+    if not sec: return ""
     s = int(sec)
     h, rem = divmod(s, 3600)
     m, s = divmod(rem, 60)
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-
 
 # ---------- yt-dlp ----------
 
@@ -312,14 +316,10 @@ def base_opts(outdir: str | None = None) -> dict:
         "logger": QuietLogger(),
         "cachedir": False,
     }
-    if FFMPEG:
-        opts["ffmpeg_location"] = FFMPEG
-    if outdir:
-        opts["outtmpl"] = f"{outdir}/%(id)s.%(ext)s"
-    if os.path.exists(COOKIES_FILE):
-        opts["cookiefile"] = COOKIES_FILE
+    if FFMPEG: opts["ffmpeg_location"] = FFMPEG
+    if outdir: opts["outtmpl"] = f"{outdir}/%(id)s.%(ext)s"
+    if os.path.exists(COOKIES_FILE): opts["cookiefile"] = COOKIES_FILE
     return opts
-
 
 def fetch_info(url: str) -> dict:
     opts = base_opts()
@@ -331,19 +331,16 @@ def fetch_info(url: str) -> dict:
         info = entries[0] if entries else {}
     return info
 
-
 def download(url: str, fmt: str, outdir: str, extract_audio: bool = False) -> Path | None:
     opts = base_opts(outdir)
     opts.update(format=fmt, max_filesize=LIMIT, playlist_items="1")
-    if HAVE_FFMPEG:
-        opts["merge_output_format"] = "mp4"
+    if HAVE_FFMPEG: opts["merge_output_format"] = "mp4"
     if extract_audio:
         opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "m4a", "preferredquality": "5"}]
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.extract_info(url, download=True)
     files = [p for p in Path(outdir).glob("*") if p.is_file() and p.suffix not in (".part", ".ytdl")]
     return max(files, key=lambda p: p.stat().st_size) if files else None
-
 
 def error_text(e: Exception, uid: int) -> str:
     text = f"❌ {html.escape(clean_error(e))}"
@@ -352,16 +349,13 @@ def error_text(e: Exception, uid: int) -> str:
         text += f"\n\n<b>Owner debug:</b>\n<code>{html.escape(raw)}</code>"
     return text
 
-
 def source_url_from_message(message) -> str | None:
     for entity in getattr(message, "entities", None) or []:
         if entity.type == "text_link" and entity.url:
             return entity.url
     return None
 
-
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
-
 
 # ---------- Telegram handlers ----------
 
@@ -374,7 +368,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Only download content you own or have permission to save.",
         parse_mode=ParseMode.HTML,
     )
-
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -394,15 +387,12 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     status = await msg.reply_text("🔎 Checking the link…")
     
-    # ----------------------------------------------------
-    # NEW: YouTube bypass to avoid yt-dlp BotGuard crashes
-    # ----------------------------------------------------
-    is_youtube = "youtube.com" in url or "youtu.be" in url
-    if is_youtube:
+    # NEW: Instant YouTube bypass (Skip yt-dlp BotGuard crashes completely)
+    if "youtube.com" in url or "youtu.be" in url:
         lines = [
             "🔗 <b>YouTube Link Detected</b>", "",
-            "🎬 Video: Available via Cobalt",
-            "🎵 Audio: Available via Cobalt",
+            "🎬 Video: Available via Server",
+            "🎵 Audio: Available via Server",
             f'\n<a href="{html.escape(url, quote=True)}">Source</a>'
         ]
         buttons = [Btn("🎬 Video", callback_data="dl:v"), Btn("🎵 Audio", callback_data="dl:a")]
@@ -414,9 +404,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ----------------------------------------------------
     # Standard metadata fetch (Reddit, Insta, FB, etc)
-    # ----------------------------------------------------
     try:
         async with sem:
             info = await asyncio.wait_for(asyncio.to_thread(fetch_info, url), timeout=FETCH_TIMEOUT)
@@ -448,7 +436,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     buttons = []
     
-    # WE NO LONGER HIDE THE VIDEO BUTTON IF LARGE - Users get direct link fallback
+    # We no longer hide buttons for large files; users will receive a direct download link instead.
     if vp:
         h = f"{vp['height']}p · " if vp["height"] else ""
         lines.append(f"🎬 Video: {h}{size_txt(vp['est'])}")
@@ -475,7 +463,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         link_preview_options=NO_PREVIEW,
     )
 
-
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     mode = "audio" if q.data == "dl:a" else "video" if q.data == "dl:v" else None
@@ -498,59 +485,44 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     active_users.add(uid)
     last_download[uid] = time.time()
-    
-    is_youtube = "youtube.com" in url or "youtu.be" in url
 
     # ----------------------------------------------------
-    # COBALT BYPASS BLOCK (Strictly YouTube & Fallback)
+    # COBALT FALLBACK BLOCK (For YouTube)
     # ----------------------------------------------------
-    if is_youtube:
+    if "youtube.com" in url or "youtu.be" in url:
         try:
             await q.edit_message_text("⏳ Processing YouTube link securely...")
-            async with httpx.AsyncClient(timeout=45.0) as client:
-                req_body = {
-                    "url": url, 
-                    "videoQuality": "720", 
-                    "downloadMode": "audio" if mode == "audio" else "auto"
-                }
-                res = await client.post("https://api.cobalt.tools/", json=req_body, headers={"Accept": "application/json", "Content-Type": "application/json"})
-                data = res.json()
+            direct_url = await call_cobalt(url, mode)
+            
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                head_res = await client.head(direct_url, follow_redirects=True)
+                size_bytes = int(head_res.headers.get("Content-Length", 0))
+                size_mb = size_bytes / 1e6 if size_bytes else 0
                 
-                if data.get("status") == "error":
-                    raise UserError(data.get("text", "Cobalt returned an error."))
-                
-                if data.get("status") in ["tunnel", "redirect"] and data.get("url"):
-                    direct_url = data["url"]
-                    head_res = await client.head(direct_url, follow_redirects=True)
-                    size_bytes = int(head_res.headers.get("Content-Length", 0))
-                    size_mb = size_bytes / 1e6 if size_bytes else 0
-                    
-                    if 0 < size_mb <= 49.0 or size_bytes == 0:
-                        await q.edit_message_text(f"📤 Uploading natively via Telegram... ({size_mb:.1f} MB)" if size_mb else "📤 Uploading natively via Telegram...")
-                        if mode == "audio":
-                            await ctx.bot.send_audio(chat_id=chat_id, audio=direct_url, read_timeout=UPLOAD_TIMEOUT, write_timeout=UPLOAD_TIMEOUT)
-                        else:
-                            await ctx.bot.send_video(chat_id=chat_id, video=direct_url, read_timeout=UPLOAD_TIMEOUT, write_timeout=UPLOAD_TIMEOUT)
-                        await q.message.delete()
-                    else:
-                        markup = Markup([[Btn(f"⬇️ Download {'Audio' if mode == 'audio' else 'Video'} ({size_mb:.1f} MB)", url=direct_url)]])
-                        await q.edit_message_text(
-                            f"This file is {size_mb:.1f} MB, which exceeds Telegram's 50MB bot upload limit.\n\nClick below to download it directly to your device:",
-                            reply_markup=markup
-                        )
+            if 0 < size_mb <= 49.0 or size_bytes == 0:
+                await q.edit_message_text(f"📤 Uploading natively via Telegram... ({size_mb:.1f} MB)" if size_mb else "📤 Uploading natively via Telegram...")
+                if mode == "audio":
+                    await ctx.bot.send_audio(chat_id=chat_id, audio=direct_url, read_timeout=UPLOAD_TIMEOUT, write_timeout=UPLOAD_TIMEOUT)
                 else:
-                    raise UserError("Could not process this YouTube link natively.")
+                    await ctx.bot.send_video(chat_id=chat_id, video=direct_url, read_timeout=UPLOAD_TIMEOUT, write_timeout=UPLOAD_TIMEOUT)
+                await q.message.delete()
+            else:
+                markup = Markup([[Btn(f"⬇️ Download {'Audio' if mode == 'audio' else 'Video'} ({size_mb:.1f} MB)", url=direct_url)]])
+                await q.edit_message_text(
+                    f"This file is {size_mb:.1f} MB, which exceeds Telegram's 50MB bot upload limit.\n\nClick below to download it directly to your device:",
+                    reply_markup=markup
+                )
         except UserError as e:
             await q.edit_message_text(f"⚠️ {e}")
         except Exception as e:
-            log.warning(f"Cobalt download failed: {e}")
-            await q.edit_message_text(f"❌ Failed to process YouTube link: {str(e)[:100]}")
+            log.warning(f"Cobalt processing failed: {e}")
+            await q.edit_message_text("❌ Failed to process YouTube link.")
         finally:
             active_users.discard(uid)
         return
 
     # ----------------------------------------------------
-    # STANDARD YT-DLP DOWNLOAD BLOCK (Reddit, Insta, FB)
+    # STANDARD YT-DLP BLOCK (Reddit, Insta, FB)
     # ----------------------------------------------------
     outdir = tempfile.mkdtemp(dir=tempfile.gettempdir())
     try:
@@ -566,23 +538,19 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             
         est_mb = (plan["est"] or 0) / 1e6
 
-        # Safety Net 1: Skip yt-dlp download entirely if we ALREADY know it's too big
+        # Safety Net 1: Skip yt-dlp download if we know it's > 50MB
         if est_mb > 49.5:
             await q.edit_message_text(f"Estimated size is ~{est_mb:.1f} MB (Too large for Telegram). Generating direct link...")
-            async with httpx.AsyncClient(timeout=45.0) as client:
-                req_body = {"url": url, "videoQuality": "720", "downloadMode": "audio" if mode == "audio" else "auto"}
-                res = await client.post("https://api.cobalt.tools/", json=req_body, headers={"Accept": "application/json", "Content-Type": "application/json"})
-                data = res.json()
-                if data.get("status") in ["tunnel", "redirect"] and data.get("url"):
-                    direct_url = data["url"]
-                    markup = Markup([[Btn(f"⬇️ Download {'Audio' if mode == 'audio' else 'Video'}", url=direct_url)]])
-                    await q.edit_message_text(
-                        f"This file is estimated around ~{est_mb:.0f} MB, which exceeds Telegram's bot upload limit.\n\nClick below to download it directly to your device:",
-                        reply_markup=markup
-                    )
-                    return
-                else:
-                    raise UserError(f"Estimated size is ~{est_mb:.0f} MB (too large for Telegram), and a direct link could not be generated.")
+            try:
+                direct_url = await call_cobalt(url, mode)
+                markup = Markup([[Btn(f"⬇️ Download {'Audio' if mode == 'audio' else 'Video'}", url=direct_url)]])
+                await q.edit_message_text(
+                    f"This file is estimated around ~{est_mb:.0f} MB, which exceeds Telegram's bot upload limit.\n\nClick below to download it directly to your device:",
+                    reply_markup=markup
+                )
+            except UserError:
+                await q.edit_message_text(f"Estimated size is ~{est_mb:.0f} MB (too large for Telegram), and a direct link could not be generated.")
+            return
 
         await q.edit_message_text("⏳ Downloading…")
         extract = mode == "audio" and plan.get("extract", False)
@@ -598,23 +566,19 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         size = path.stat().st_size
         size_mb = size / 1e6
         
-        # Safety Net 2: File grew larger than expected after downloading
+        # Safety Net 2: File grew larger than 50MB after downloading
         if size_mb > 49.5:
             await q.edit_message_text(f"File downloaded but is {size_mb:.1f} MB (Too large to upload to Telegram). Generating direct link...")
-            async with httpx.AsyncClient(timeout=45.0) as client:
-                req_body = {"url": url, "videoQuality": "720", "downloadMode": "audio" if mode == "audio" else "auto"}
-                res = await client.post("https://api.cobalt.tools/", json=req_body, headers={"Accept": "application/json", "Content-Type": "application/json"})
-                data = res.json()
-                if data.get("status") in ["tunnel", "redirect"] and data.get("url"):
-                    direct_url = data["url"]
-                    markup = Markup([[Btn(f"⬇️ Download {'Audio' if mode == 'audio' else 'Video'} ({size_mb:.1f} MB)", url=direct_url)]])
-                    await q.edit_message_text(
-                        f"This file is {size_mb:.1f} MB, which exceeds Telegram's bot upload limit.\n\nClick below to download it directly to your device:",
-                        reply_markup=markup
-                    )
-                    return
-                else:
-                    raise UserError(f"File is {size_mb:.1f} MB (too large for Telegram), and a direct link could not be generated.")
+            try:
+                direct_url = await call_cobalt(url, mode)
+                markup = Markup([[Btn(f"⬇️ Download {'Audio' if mode == 'audio' else 'Video'} ({size_mb:.1f} MB)", url=direct_url)]])
+                await q.edit_message_text(
+                    f"This file is {size_mb:.1f} MB, which exceeds Telegram's bot upload limit.\n\nClick below to download it directly to your device:",
+                    reply_markup=markup
+                )
+            except UserError:
+                await q.edit_message_text(f"File is {size_mb:.1f} MB (too large for Telegram), and a direct link could not be generated.")
+            return
 
         await q.edit_message_text(f"📤 Uploading… ({size_mb:.1f} MB)")
         t0 = time.time()
@@ -659,10 +623,8 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         active_users.discard(uid)
         shutil.rmtree(outdir, ignore_errors=True)
 
-
 async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
     log.error("handler error", exc_info=ctx.error)
-
 
 # ---------- Telegram application (created lazily, once per server instance) ----------
 
@@ -677,10 +639,8 @@ def build_tg(request=None) -> Application:
     tg.add_error_handler(on_error)
     return tg
 
-
 _tg: Application | None = None
 _tg_lock = asyncio.Lock()
-
 
 async def get_tg() -> Application:
     global _tg
@@ -691,7 +651,6 @@ async def get_tg() -> Application:
                 await tg.initialize()
                 _tg = tg
     return _tg
-
 
 async def run_update(tg: Application, update: Update):
     try:
@@ -704,7 +663,6 @@ async def run_update(tg: Application, update: Update):
 
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
-
 @app.get("/")
 @app.get("/api/health")
 async def health():
@@ -714,7 +672,6 @@ async def health():
         "webhook_secret_set": bool(WEBHOOK_SECRET),
         "ffmpeg": HAVE_FFMPEG,
     }
-
 
 @app.post("/api/webhook")
 async def webhook(request: Request, background: BackgroundTasks):
