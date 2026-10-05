@@ -59,7 +59,17 @@ LOW_HEIGHT = int(os.getenv("LOW_HEIGHT", "360"))
 MAX_PARALLEL = int(os.getenv("MAX_PARALLEL", "2"))
 USER_COOLDOWN = int(os.getenv("USER_COOLDOWN", "10"))
 CHECK_COOLDOWN = int(os.getenv("CHECK_COOLDOWN", "3"))
-COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt")
+COOKIES_FILE = "/tmp/cookies.txt"
+_yt_cookies = os.getenv("YT_COOKIES", "").strip()
+if _yt_cookies:
+    # some dashboards turn real newlines into the two characters \n
+    if "\n" not in _yt_cookies and "\\n" in _yt_cookies:
+        _yt_cookies = _yt_cookies.replace("\\n", "\n")
+    try:
+        with open(COOKIES_FILE, "w", encoding="utf-8") as _f:
+            _f.write(_yt_cookies + "\n")
+    except OSError:
+        pass
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 # 1 = finish the work before answering Telegram (debugging). Default 0 = answer Telegram
 # immediately and do the work in the background (Telegram never times out / retries).
@@ -179,6 +189,8 @@ def clean_error(err: Exception) -> str:
     low = msg.lower()
     if any(k in low for k in ("cloudflare", "anti-bot", "http error 403", "forbidden")):
         return "This site blocked my server. Please try again later."
+    if "not a bot" in low:
+        return "YouTube is blocking my server right now. Please try again later."    
     if any(k in low for k in ("login", "sign in", "cookies", "private", "authentication")):
         return "This link needs a login or is private, so I can't download it."
     if "unsupported url" in low:
