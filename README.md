@@ -36,4 +36,3 @@ If you change the environment variables later, redeploy (Vercel only applies the
 - Webhook set but bot silent -> Vercel > Logs, and `getWebhookInfo` (printed by set_webhook.py) shows `last_error_message`.
 - Add `INLINE_PROCESSING=1` in Vercel to make the function finish its work before replying to Telegram (easier to debug in Logs). Remove it afterwards.
 - `OWNER_ID=<your telegram id>` makes the bot show you the raw yt-dlp error in chat.
-2.0
