@@ -193,25 +193,35 @@ def clean_error(err: Exception) -> str:
     return "Could not read that link. It may be removed, private, or blocked."
 
 
-# ---------- RapidAPI Helper ----------
+# ---------- RapidAPI Helper (DataFanatic v2) ----------
 
 async def call_rapidapi(url: str, mode: str) -> str:
-    """Fetches direct media download link from RapidAPI."""
+    """Fetches direct video/audio download URL from DataFanatic YouTube API."""
     api_key = os.getenv("RAPID_API_KEY", "").strip()
-    api_host = os.getenv("RAPID_API_HOST", "").strip()
-    api_url = os.getenv("RAPID_API_URL", "").strip() or (f"https://{api_host}/download" if api_host else "")
+    api_host = os.getenv("RAPID_API_HOST", "youtube-media-downloader.p.rapidapi.com").strip()
+    api_url = os.getenv("RAPID_API_URL", "https://youtube-media-downloader.p.rapidapi.com/v2/video/details").strip()
 
-    if not api_key or not api_host:
-        raise UserError("RAPID_API_KEY or RAPID_API_HOST is missing in environment variables.")
+    if not api_key:
+        raise UserError("RAPID_API_KEY is missing in Vercel settings.")
+
+    # Extract YouTube 11-char video ID
+    match = re.search(r"(?:v=|\/|youtu\.be\/)([0-9A-Za-z_-]{11})", url)
+    video_id = match.group(1) if match else url
 
     headers = {
         "x-rapidapi-key": api_key,
         "x-rapidapi-host": api_host,
     }
-    querystring = {"url": url}
+    
+    # urlAccess="normal" is required to receive direct media file URLs
+    params = {
+        "videoId": video_id,
+        "urlAccess": "normal",
+        "audios": "true",
+    }
 
     async with httpx.AsyncClient(timeout=25.0, verify=False) as client:
-        res = await client.get(api_url, headers=headers, params=querystring)
+        res = await client.get(api_url, headers=headers, params=params)
         if res.status_code != 200:
             raise UserError(f"API server responded with HTTP {res.status_code}.")
 
@@ -220,17 +230,35 @@ async def call_rapidapi(url: str, mode: str) -> str:
         except Exception as e:
             raise UserError("Invalid response received from API.") from e
 
+        if mode == "audio":
+            audios = data.get("audios", {}).get("items", []) or data.get("audios", [])
+            if audios and isinstance(audios, list):
+                # Pick the highest quality or first available audio stream
+                best_audio = audios[0] if audios else None
+                direct_url = best_audio.get("url") if isinstance(best_audio, dict) else None
+                if direct_url:
+                    return direct_url
+
+        # Video mode (or audio fallback)
+        videos = data.get("videos", {}).get("items", []) or data.get("videos", [])
+        if videos and isinstance(videos, list):
+            # Prefer 720p or lower mp4
+            candidates = [v for v in videos if isinstance(v, dict) and v.get("url")]
+            p720 = [v for v in candidates if v.get("quality") in ("720p", "480p", "360p")]
+            chosen = p720[0] if p720 else (candidates[0] if candidates else None)
+            if chosen and chosen.get("url"):
+                return chosen["url"]
+
+        # General fallbacks
         direct_url = (
-            data.get("link")
-            or data.get("url")
-            or data.get("download_url")
-            or (data.get("data", {}).get("video_url") if isinstance(data.get("data"), dict) else None)
-            or (data.get("data", {}).get("download_url") if isinstance(data.get("data"), dict) else None)
-            or (data.get("result", {}).get("url") if isinstance(data.get("result"), dict) else None)
+            data.get("url")
+            or data.get("link")
+            or data.get("downloadUrl")
         )
 
         if not direct_url:
-            raise UserError("Could not extract a direct media link from the API response.")
+            err_msg = data.get("message") or data.get("errorId") or "Could not extract direct stream URL"
+            raise UserError(f"API extraction failed: {err_msg}")
 
         return direct_url
 
