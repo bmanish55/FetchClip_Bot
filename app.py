@@ -202,7 +202,9 @@ async def call_cobalt(url: str, mode: str) -> str:
     }
     
     last_err = "Unknown error"
-    async with httpx.AsyncClient(timeout=25.0) as client:
+    
+    # NOTE: verify=False strictly ignores self-signed certificate errors from community servers
+    async with httpx.AsyncClient(timeout=25.0, verify=False) as client:
         for api_url in instances:
             try:
                 res = await client.post(api_url, json=req_body, headers=headers)
@@ -211,7 +213,6 @@ async def call_cobalt(url: str, mode: str) -> str:
                     if data.get("status") in ["tunnel", "redirect"] and data.get("url"):
                         return data["url"]
                     elif data.get("status") == "error":
-                        # Parses new v10 error format correctly
                         last_err = data.get("error", {}).get("code", "Blocked by Bot Protection")
             except Exception as e:
                 last_err = str(e)
@@ -387,7 +388,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     status = await msg.reply_text("🔎 Checking the link…")
     
-    # NEW: Instant YouTube bypass (Skip yt-dlp BotGuard crashes completely)
+    # NEW: Instant YouTube bypass
     if "youtube.com" in url or "youtu.be" in url:
         lines = [
             "🔗 <b>YouTube Link Detected</b>", "",
@@ -436,7 +437,6 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     buttons = []
     
-    # We no longer hide buttons for large files; users will receive a direct download link instead.
     if vp:
         h = f"{vp['height']}p · " if vp["height"] else ""
         lines.append(f"🎬 Video: {h}{size_txt(vp['est'])}")
@@ -494,7 +494,8 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("⏳ Processing YouTube link securely...")
             direct_url = await call_cobalt(url, mode)
             
-            async with httpx.AsyncClient(timeout=20.0) as client:
+            # verify=False bypasses strict SSL checks on the destination link size check
+            async with httpx.AsyncClient(timeout=20.0, verify=False) as client:
                 head_res = await client.head(direct_url, follow_redirects=True)
                 size_bytes = int(head_res.headers.get("Content-Length", 0))
                 size_mb = size_bytes / 1e6 if size_bytes else 0
@@ -538,7 +539,6 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             
         est_mb = (plan["est"] or 0) / 1e6
 
-        # Safety Net 1: Skip yt-dlp download if we know it's > 50MB
         if est_mb > 49.5:
             await q.edit_message_text(f"Estimated size is ~{est_mb:.1f} MB (Too large for Telegram). Generating direct link...")
             try:
@@ -566,7 +566,6 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         size = path.stat().st_size
         size_mb = size / 1e6
         
-        # Safety Net 2: File grew larger than 50MB after downloading
         if size_mb > 49.5:
             await q.edit_message_text(f"File downloaded but is {size_mb:.1f} MB (Too large to upload to Telegram). Generating direct link...")
             try:
