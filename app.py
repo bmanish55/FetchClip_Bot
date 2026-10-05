@@ -386,6 +386,11 @@ def base_opts(outdir: str | None = None) -> dict:
         "retries": 2,
         "logger": QuietLogger(),
         "cachedir": False,
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+        },
     }
     if FFMPEG:
         opts["ffmpeg_location"] = FFMPEG
@@ -579,17 +584,21 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 size_bytes = int(head_res.headers.get("Content-Length", 0))
                 size_mb = size_bytes / 1e6 if size_bytes else 0
 
-            if 0 < size_mb <= 49.0 or size_bytes == 0:
-                await q.edit_message_text(f"📤 Uploading natively via Telegram... ({size_mb:.1f} MB)" if size_mb else "📤 Uploading natively via Telegram...")
+            # If the CDN doesn't provide Content-Length (size_bytes == 0) or it's > 49MB,
+            # do NOT risk Telegram failing. Provide the direct download button instead.
+            if 0 < size_mb <= 49.0:
+                await q.edit_message_text(f"📤 Uploading natively via Telegram... ({size_mb:.1f} MB)")
                 if mode == "audio":
                     await ctx.bot.send_audio(chat_id=chat_id, audio=direct_url, read_timeout=UPLOAD_TIMEOUT, write_timeout=UPLOAD_TIMEOUT)
                 else:
                     await ctx.bot.send_video(chat_id=chat_id, video=direct_url, read_timeout=UPLOAD_TIMEOUT, write_timeout=UPLOAD_TIMEOUT)
                 await q.message.delete()
             else:
-                markup = Markup([[Btn(f"⬇️ Download {'Audio' if mode == 'audio' else 'Video'} ({size_mb:.1f} MB)", url=direct_url)]])
+                label_size = f" ({size_mb:.1f} MB)" if size_mb > 0 else ""
+                markup = Markup([[Btn(f"⬇️ Download {'Audio' if mode == 'audio' else 'Video'}{label_size}", url=direct_url)]])
                 await q.edit_message_text(
-                    f"This file is {size_mb:.1f} MB, which exceeds Telegram's 50MB bot upload limit.\n\nClick below to download it directly to your device:",
+                    "This video exceeds Telegram's 50 MB bot upload limit.\n\n"
+                    "Tap below to stream or download it directly:",
                     reply_markup=markup,
                 )
         except UserError as e:
