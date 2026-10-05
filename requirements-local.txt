@@ -1,0 +1,6 @@
+fastapi>=0.115
+python-telegram-bot>=21.7
+yt-dlp[default]
+imageio-ffmpeg>=0.5
+python-dotenv>=1.0
+uvicorn>=0.30
