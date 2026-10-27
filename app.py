@@ -185,7 +185,7 @@ def clean_error(err: Exception) -> str:
     if any(k in low for k in ("login", "sign in", "cookies", "private", "authentication")):
         return "This link requires authentication or is private, so it cannot be downloaded."
     if "unsupported url" in low:
-        return "This link is not supported."
+        return "This website's video player isn't supported, so I can't fetch it."
     if "javascript runtime" in low or "not available" in low:
         return "This link is currently unavailable on the server."
     if "unable to download webpage" in low or "timed out" in low:
@@ -298,7 +298,9 @@ def pick_video(cands: list[dict]) -> dict | None:
     low = [f for f in cands if 0 < qual(f) <= LOW_HEIGHT]
     if low:
         return max(low, key=lambda f: (qual(f), avc(f), f.get("ext") == "mp4", f.get("tbr") or 0))
-    return None
+    # sab formats limit se bade hain -> sabse chhota wala le lo (Audio-only na bane)
+    known = [f for f in cands if qual(f) > 0] or cands
+    return min(known, key=lambda f: (qual(f) or 10**9, f.get("tbr") or 0))
 
 
 def pick_audio(fmts: list[dict]) -> dict | None:
@@ -460,6 +462,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     uid = update.effective_user.id
     url = extract_url(msg.text)
+    log.info("link from %s: %s", uid, url)
 
     if not url:
         await msg.reply_text("Please send a valid link starting with http:// or https://")
