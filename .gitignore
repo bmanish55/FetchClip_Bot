@@ -1,10 +1,30 @@
+# Local secrets and environment files
 .env
 .env.*
 !.env.example
 cookies.txt
+YT_COOKIES.txt
+*.cookies
+*.cookie
+
+# Local tooling and generated state
 .vercel/
 __pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
 .venv/
 venv/
+ENV/
+
+# Temporary media and debug output
 downloads/
-YT_COOKIES.txt/
+tmp/
+temp/
+*.part
+*.ytdl
